@@ -135,11 +135,6 @@ export default function CoachingMatrix() {
     if (coords) setPreview(coords);
   }
 
-  function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!canPlaceRef.current) return;
-    const coords = getCoords(e);
-    if (coords) setPreview(coords);
-  }
 
   async function handleSubmit() {
     if (!preview || !name) return;
@@ -252,7 +247,6 @@ export default function CoachingMatrix() {
             cursor: phase === "placement" ? "crosshair" : "default",
           }}
           onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
         >
           <div style={{ background: "#FFD700" }} />
           <div style={{ background: "#22C55E" }} />
