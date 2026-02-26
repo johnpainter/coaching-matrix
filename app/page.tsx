@@ -146,7 +146,7 @@ export default function CoachingMatrix() {
     setPhase("placement");
   }, [nameInput]);
 
-  const getMatrixCoords = useCallback(
+  const getCoordsFromPointer = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       const rect = matrixRef.current?.getBoundingClientRect();
       if (!rect) return null;
@@ -157,25 +157,31 @@ export default function CoachingMatrix() {
     []
   );
 
-  const handleMatrixPointer = useCallback(
+  const handlePointerDown = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (phase !== "placement") return;
-      const coords = getMatrixCoords(e);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      const coords = getCoordsFromPointer(e);
       if (coords) setPreview(coords);
     },
-    [phase, getMatrixCoords]
+    [phase, getCoordsFromPointer]
   );
 
-  const handleMatrixClick = useCallback(
-    (e: React.MouseEvent<HTMLDivElement>) => {
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
       if (phase !== "placement") return;
-      const rect = matrixRef.current?.getBoundingClientRect();
-      if (!rect) return;
-      const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-      setPreview({ x, y });
+      // Only update preview while dragging (button pressed)
+      if (e.buttons === 0 && e.pointerType === "mouse") {
+        const coords = getCoordsFromPointer(e);
+        if (coords) setPreview(coords);
+        return;
+      }
+      if (e.buttons > 0 || e.pointerType === "touch") {
+        const coords = getCoordsFromPointer(e);
+        if (coords) setPreview(coords);
+      }
     },
-    [phase]
+    [phase, getCoordsFromPointer]
   );
 
   const handleSubmit = useCallback(async () => {
@@ -293,8 +299,9 @@ export default function CoachingMatrix() {
         <div
           ref={matrixRef}
           className="absolute inset-0 grid grid-cols-2 grid-rows-2 gap-0.5 bg-white cursor-crosshair"
-          onPointerMove={handleMatrixPointer}
-          onClick={handleMatrixClick}
+          style={{ touchAction: "none" }}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
         >
           {/* Top-left: Yellow */}
           <div style={{ backgroundColor: "#FFD700" }} />
