@@ -100,14 +100,17 @@ export default function CoachingMatrix() {
         .on(
           "postgres_changes",
           { event: "UPDATE", schema: "public", table: "app_state" },
-          (payload) => {
+          async (payload) => {
             const rev = (payload.new as { revealed: boolean }).revealed;
-            setRevealed(rev);
-            // If reset (revealed → false), clear submitted so users can re-place
-            if (!rev) {
+            if (rev) {
+              // Re-fetch so this user sees all placements when revealed
+              const { data } = await supabase.from("placements").select("*");
+              if (data) setPlacements(data as Placement[]);
+            } else {
               setSubmitted(false);
               setPreview(null);
             }
+            setRevealed(rev);
           }
         )
         .subscribe();
@@ -136,16 +139,31 @@ export default function CoachingMatrix() {
   }
 
 
+  async function fetchPlacements() {
+    const { data } = await supabase.from("placements").select("*");
+    if (data) setPlacements(data as Placement[]);
+  }
+
   async function handleSubmit() {
     if (!preview || !name) return;
     const { error } = await supabase
       .from("placements")
       .upsert({ name, x: preview.x, y: preview.y }, { onConflict: "name" });
-    if (!error) setSubmitted(true);
+    if (!error) {
+      // Optimistic update — don't wait for realtime echo
+      setPlacements((prev) => [
+        ...prev.filter((p) => p.name !== name),
+        { id: "local", name, x: preview.x, y: preview.y, created_at: "" },
+      ]);
+      setSubmitted(true);
+    }
   }
 
   async function handleReveal() {
     await supabase.from("app_state").update({ revealed: true }).eq("id", 1);
+    // Re-fetch all placements so the revealer sees everyone's dots immediately
+    await fetchPlacements();
+    setRevealed(true);
   }
 
   async function handleReset() {
