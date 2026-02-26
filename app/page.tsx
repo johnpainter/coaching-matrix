@@ -2,23 +2,13 @@
 
 export const dynamic = "force-dynamic";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase, type Placement } from "@/lib/supabase";
 
-type AppPhase = "name_entry" | "placement" | "submitted" | "revealed";
-
-// Preset dot colors for other participants (own dot is always white-bordered)
 const DOT_COLORS = [
-  "#F97316", // orange
-  "#A855F7", // purple
-  "#EC4899", // pink
-  "#06B6D4", // cyan
-  "#84CC16", // lime
-  "#F59E0B", // amber
-  "#14B8A6", // teal
-  "#6366F1", // indigo
-  "#EF4444", // red
-  "#22C55E", // green
+  "#F97316", "#A855F7", "#EC4899", "#06B6D4",
+  "#84CC16", "#F59E0B", "#14B8A6", "#6366F1",
+  "#EF4444", "#22C55E",
 ];
 
 function truncate(s: string, max = 12) {
@@ -26,87 +16,97 @@ function truncate(s: string, max = 12) {
 }
 
 export default function CoachingMatrix() {
-  const [phase, setPhase] = useState<AppPhase>("name_entry");
+  const [name, setName] = useState<string | null>(null);
   const [nameInput, setNameInput] = useState("");
-  const [myName, setMyName] = useState("");
   const [preview, setPreview] = useState<{ x: number; y: number } | null>(null);
-  const [myPlacement, setMyPlacement] = useState<{ x: number; y: number } | null>(null);
-  const [allPlacements, setAllPlacements] = useState<Placement[]>([]);
+  const [submitted, setSubmitted] = useState(false);
+  const [placements, setPlacements] = useState<Placement[]>([]);
   const [revealed, setRevealed] = useState(false);
-  const matrixRef = useRef<HTMLDivElement>(null);
 
-  // Restore from localStorage on mount
+  const matrixRef = useRef<HTMLDivElement>(null);
+  // Written during render so event handlers always read the latest value
+  const canPlaceRef = useRef(false);
+
+  // Phase is purely derived — no setState("phase") anywhere
+  const phase = !name
+    ? "name_entry"
+    : revealed
+    ? "revealed"
+    : submitted
+    ? "submitted"
+    : "placement";
+
+  // Keep canPlaceRef current every render (no stale closure in pointer handlers)
+  canPlaceRef.current = phase === "placement";
+
+  // Restore name from localStorage (submitted state comes from DB, not localStorage)
   useEffect(() => {
-    const savedName = localStorage.getItem("coaching_matrix_name");
-    const savedSubmitted = localStorage.getItem("coaching_matrix_submitted");
-    if (savedName) {
-      setMyName(savedName);
-      if (savedSubmitted === "true") {
-        setPhase("submitted");
-      } else {
-        setPhase("placement");
-      }
-    }
+    const saved = localStorage.getItem("cm_name");
+    if (saved) setName(saved);
   }, []);
 
-  // Fetch initial data and set up real-time subscriptions
+  // Supabase: initial fetch + real-time subscriptions
   useEffect(() => {
-    let placementsChannel: ReturnType<typeof supabase.channel> | null = null;
-    let appStateChannel: ReturnType<typeof supabase.channel> | null = null;
+    let pc: ReturnType<typeof supabase.channel> | null = null;
+    let ac: ReturnType<typeof supabase.channel> | null = null;
 
     async function init() {
-      // Fetch current placements
-      const { data: placementsData } = await supabase
-        .from("placements")
-        .select("*");
-      if (placementsData) setAllPlacements(placementsData as Placement[]);
+      const [{ data: ps }, { data: as }] = await Promise.all([
+        supabase.from("placements").select("*"),
+        supabase.from("app_state").select("*").eq("id", 1).single(),
+      ]);
 
-      // Fetch current app state
-      const { data: stateData } = await supabase
-        .from("app_state")
-        .select("*")
-        .eq("id", 1)
-        .single();
-      if (stateData?.revealed) {
-        setRevealed(true);
-        setPhase("revealed");
+      if (ps) setPlacements(ps as Placement[]);
+      if (as?.revealed) setRevealed(true);
+
+      // Restore submitted state: if user's placement exists in DB, they already submitted
+      const savedName = localStorage.getItem("cm_name");
+      if (savedName && ps) {
+        const found = (ps as Placement[]).some((p) => p.name === savedName);
+        if (found) setSubmitted(true);
       }
 
-      // Subscribe to placements changes
-      placementsChannel = supabase
-        .channel("placements-changes")
+      pc = supabase
+        .channel("placements-rt")
         .on(
           "postgres_changes",
           { event: "*", schema: "public", table: "placements" },
           (payload) => {
-            if (payload.eventType === "INSERT" || payload.eventType === "UPDATE") {
-              setAllPlacements((prev) => {
-                const filtered = prev.filter(
-                  (p) => p.name !== (payload.new as Placement).name
-                );
-                return [...filtered, payload.new as Placement];
-              });
+            if (
+              payload.eventType === "INSERT" ||
+              payload.eventType === "UPDATE"
+            ) {
+              const incoming = payload.new as Placement;
+              setPlacements((prev) => [
+                ...prev.filter((p) => p.name !== incoming.name),
+                incoming,
+              ]);
             } else if (payload.eventType === "DELETE") {
-              setAllPlacements((prev) =>
-                prev.filter((p) => p.id !== (payload.old as Placement).id)
-              );
+              const deleted = payload.old as Placement;
+              setPlacements((prev) => prev.filter((p) => p.id !== deleted.id));
+              // If our own placement was deleted (session reset), go back to placement
+              const myName = localStorage.getItem("cm_name");
+              if (myName && deleted.name === myName) {
+                setSubmitted(false);
+                setPreview(null);
+              }
             }
           }
         )
         .subscribe();
 
-      // Subscribe to app_state changes
-      appStateChannel = supabase
-        .channel("app-state-changes")
+      ac = supabase
+        .channel("appstate-rt")
         .on(
           "postgres_changes",
           { event: "UPDATE", schema: "public", table: "app_state" },
           (payload) => {
-            if (payload.new && (payload.new as { revealed: boolean }).revealed) {
-              setRevealed(true);
-              setPhase("revealed");
-            } else if (payload.new && !(payload.new as { revealed: boolean }).revealed) {
-              setRevealed(false);
+            const rev = (payload.new as { revealed: boolean }).revealed;
+            setRevealed(rev);
+            // If reset (revealed → false), clear submitted so users can re-place
+            if (!rev) {
+              setSubmitted(false);
+              setPreview(null);
             }
           }
         )
@@ -114,128 +114,73 @@ export default function CoachingMatrix() {
     }
 
     init();
-
     return () => {
-      if (placementsChannel) supabase.removeChannel(placementsChannel);
-      if (appStateChannel) supabase.removeChannel(appStateChannel);
+      if (pc) supabase.removeChannel(pc);
+      if (ac) supabase.removeChannel(ac);
     };
   }, []);
 
-  // When revealed state changes, also update phase
-  useEffect(() => {
-    if (revealed) {
-      setPhase("revealed");
-    } else if (myName) {
-      const savedSubmitted = localStorage.getItem("coaching_matrix_submitted");
-      if (savedSubmitted === "true") {
-        setPhase("submitted");
-      } else if (myPlacement) {
-        setPhase("submitted");
-      } else {
-        setPhase("placement");
-      }
-    }
-  }, [revealed, myName, myPlacement]);
+  function getCoords(e: React.PointerEvent<HTMLDivElement>) {
+    const rect = matrixRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    return {
+      x: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+      y: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
+    };
+  }
 
-  const handleNameSubmit = useCallback(() => {
-    const trimmed = nameInput.trim();
-    if (!trimmed) return;
-    setMyName(trimmed);
-    localStorage.setItem("coaching_matrix_name", trimmed);
-    localStorage.removeItem("coaching_matrix_submitted");
-    setPhase("placement");
-  }, [nameInput]);
+  function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (!canPlaceRef.current) return;
+    const coords = getCoords(e);
+    if (coords) setPreview(coords);
+  }
 
-  const getCoordsFromPointer = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      const rect = matrixRef.current?.getBoundingClientRect();
-      if (!rect) return null;
-      const x = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-      const y = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
-      return { x, y };
-    },
-    []
-  );
+  function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!canPlaceRef.current) return;
+    const coords = getCoords(e);
+    if (coords) setPreview(coords);
+  }
 
-  const handlePointerDown = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (phase !== "placement") return;
-      e.currentTarget.setPointerCapture(e.pointerId);
-      const coords = getCoordsFromPointer(e);
-      if (coords) setPreview(coords);
-    },
-    [phase, getCoordsFromPointer]
-  );
+  async function handleSubmit() {
+    if (!preview || !name) return;
+    const { error } = await supabase
+      .from("placements")
+      .upsert({ name, x: preview.x, y: preview.y }, { onConflict: "name" });
+    if (!error) setSubmitted(true);
+  }
 
-  const handlePointerMove = useCallback(
-    (e: React.PointerEvent<HTMLDivElement>) => {
-      if (phase !== "placement") return;
-      // Only update preview while dragging (button pressed)
-      if (e.buttons === 0 && e.pointerType === "mouse") {
-        const coords = getCoordsFromPointer(e);
-        if (coords) setPreview(coords);
-        return;
-      }
-      if (e.buttons > 0 || e.pointerType === "touch") {
-        const coords = getCoordsFromPointer(e);
-        if (coords) setPreview(coords);
-      }
-    },
-    [phase, getCoordsFromPointer]
-  );
+  async function handleReveal() {
+    await supabase.from("app_state").update({ revealed: true }).eq("id", 1);
+  }
 
-  const handleSubmit = useCallback(async () => {
-    if (!preview || !myName) return;
-    const { error } = await supabase.from("placements").upsert(
-      { name: myName, x: preview.x, y: preview.y },
-      { onConflict: "name" }
-    );
-    if (!error) {
-      setMyPlacement(preview);
-      localStorage.setItem("coaching_matrix_submitted", "true");
-      setPhase("submitted");
-    }
-  }, [preview, myName]);
-
-  const handleRevealAll = useCallback(async () => {
-    await supabase
-      .from("app_state")
-      .update({ revealed: true })
-      .eq("id", 1);
-  }, []);
-
-  const handleReset = useCallback(async () => {
-    await supabase.from("placements").delete().neq("id", "00000000-0000-0000-0000-000000000000");
-    await supabase
-      .from("app_state")
-      .update({ revealed: false })
-      .eq("id", 1);
-    // Reset local state
-    setAllPlacements([]);
-    setMyPlacement(null);
+  async function handleReset() {
+    await Promise.all([
+      supabase
+        .from("placements")
+        .delete()
+        .neq("id", "00000000-0000-0000-0000-000000000000"),
+      supabase.from("app_state").update({ revealed: false }).eq("id", 1),
+    ]);
+    setPlacements([]);
     setPreview(null);
+    setSubmitted(false);
     setRevealed(false);
-    localStorage.removeItem("coaching_matrix_submitted");
-    if (myName) {
-      setPhase("placement");
-    }
-  }, [myName]);
+  }
 
-  // Assign stable colors to other participants
-  const otherPlacements = allPlacements.filter((p) => p.name !== myName);
-  const colorMap = new Map<string, string>();
-  otherPlacements.forEach((p, i) => {
-    colorMap.set(p.name, DOT_COLORS[i % DOT_COLORS.length]);
-  });
+  function handleNameSubmit() {
+    const n = nameInput.trim();
+    if (!n) return;
+    localStorage.setItem("cm_name", n);
+    setName(n);
+    setPreview(null);
+    setSubmitted(false);
+  }
 
-  // Dot to show for own placement on matrix
-  const myDotCoords =
-    phase === "placement"
-      ? preview
-      : phase === "submitted" || phase === "revealed"
-      ? myPlacement ?? allPlacements.find((p) => p.name === myName)
-      : null;
+  const myPlacement = placements.find((p) => p.name === name);
+  const others = placements.filter((p) => p.name !== name);
+  const myDot = phase === "placement" ? preview : (myPlacement ?? null);
 
+  // ── Name entry screen ──────────────────────────────────────────────────────
   if (phase === "name_entry") {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen gap-6 px-4">
@@ -266,80 +211,79 @@ export default function CoachingMatrix() {
     );
   }
 
+  // ── Matrix screen ──────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col items-center justify-start min-h-screen gap-5 px-4 py-8">
+    <div className="flex flex-col items-center min-h-screen gap-5 px-4 py-8">
       <h1 className="text-2xl font-bold tracking-tight">Coaching Matrix</h1>
 
-      {/* Status banner */}
-      {phase === "submitted" && (
-        <div className="text-yellow-400 font-medium animate-pulse">
-          Waiting for reveal…
-        </div>
-      )}
       {phase === "placement" && (
-        <div className="text-gray-400 text-sm">
-          Click anywhere on the matrix to place your dot, then submit.
-        </div>
+        <p className="text-gray-400 text-sm">
+          {preview
+            ? "Click to move your dot · then Submit"
+            : "Click anywhere on the matrix to place your dot"}
+        </p>
+      )}
+      {phase === "submitted" && (
+        <p className="text-yellow-400 font-medium animate-pulse">
+          Waiting for reveal…
+        </p>
       )}
       {phase === "revealed" && (
-        <div className="text-green-400 font-medium">Results revealed!</div>
+        <p className="text-green-400 font-medium">Results revealed!</p>
       )}
 
-      {/* Matrix */}
+      {/* Matrix container */}
       <div
         className="relative select-none"
         style={{
-          width: "min(80vw, 80vh, 600px)",
-          height: "min(80vw, 80vh, 600px)",
+          width: "min(80vw, 600px)",
+          height: "min(80vw, 600px)",
           maxWidth: 600,
           maxHeight: 600,
         }}
       >
-        {/* Quadrant grid */}
+        {/* Quadrant grid — event target */}
         <div
           ref={matrixRef}
-          className="absolute inset-0 grid grid-cols-2 grid-rows-2 gap-0.5 bg-white cursor-crosshair"
-          style={{ touchAction: "none" }}
+          className="absolute inset-0 grid grid-cols-2 grid-rows-2 bg-white"
+          style={{
+            gap: "2px",
+            touchAction: "none",
+            cursor: phase === "placement" ? "crosshair" : "default",
+          }}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
         >
-          {/* Top-left: Yellow */}
-          <div style={{ backgroundColor: "#FFD700" }} />
-          {/* Top-right: Green */}
-          <div style={{ backgroundColor: "#22C55E" }} />
-          {/* Bottom-left: Red */}
-          <div style={{ backgroundColor: "#EF4444" }} />
-          {/* Bottom-right: Blue */}
-          <div style={{ backgroundColor: "#3B82F6" }} />
+          <div style={{ background: "#FFD700" }} />
+          <div style={{ background: "#22C55E" }} />
+          <div style={{ background: "#EF4444" }} />
+          <div style={{ background: "#3B82F6" }} />
         </div>
 
-        {/* Own dot */}
-        {myDotCoords && (
+        {/* My dot */}
+        {myDot && (
           <div
             className="absolute pointer-events-none flex flex-col items-center"
             style={{
-              left: `${myDotCoords.x * 100}%`,
-              top: `${myDotCoords.y * 100}%`,
+              left: `${myDot.x * 100}%`,
+              top: `${myDot.y * 100}%`,
               transform: "translate(-50%, -50%)",
               zIndex: 20,
             }}
           >
-            <div
-              className="w-5 h-5 rounded-full border-2 border-white shadow-lg"
-              style={{ backgroundColor: "#1e293b" }}
-            />
+            <div className="w-6 h-6 rounded-full bg-white border-[3px] border-gray-900 shadow-xl" />
             <span
-              className="mt-1 text-xs font-bold text-white drop-shadow-md leading-none"
-              style={{ textShadow: "0 1px 3px rgba(0,0,0,0.8)" }}
+              className="mt-0.5 text-xs font-bold text-white"
+              style={{ textShadow: "0 0 4px #000, 0 1px 3px #000" }}
             >
-              {truncate(myName)}
+              {truncate(name ?? "")}
             </span>
           </div>
         )}
 
-        {/* Other dots (only when revealed) */}
+        {/* Other dots — only when revealed */}
         {phase === "revealed" &&
-          otherPlacements.map((p) => (
+          others.map((p, i) => (
             <div
               key={p.name}
               className="absolute pointer-events-none flex flex-col items-center"
@@ -351,12 +295,12 @@ export default function CoachingMatrix() {
               }}
             >
               <div
-                className="w-5 h-5 rounded-full border-2 border-white shadow-lg"
-                style={{ backgroundColor: colorMap.get(p.name) }}
+                className="w-6 h-6 rounded-full border-2 border-white shadow-xl"
+                style={{ background: DOT_COLORS[i % DOT_COLORS.length] }}
               />
               <span
-                className="mt-1 text-xs font-bold text-white drop-shadow-md leading-none"
-                style={{ textShadow: "0 1px 3px rgba(0,0,0,0.8)" }}
+                className="mt-0.5 text-xs font-bold text-white"
+                style={{ textShadow: "0 0 4px #000, 0 1px 3px #000" }}
               >
                 {truncate(p.name)}
               </span>
@@ -364,9 +308,9 @@ export default function CoachingMatrix() {
           ))}
       </div>
 
-      {/* Participant count */}
       <p className="text-gray-500 text-sm">
-        {allPlacements.length} participant{allPlacements.length !== 1 ? "s" : ""} submitted
+        {placements.length} participant{placements.length !== 1 ? "s" : ""}{" "}
+        submitted
       </p>
 
       {/* Controls */}
@@ -380,14 +324,12 @@ export default function CoachingMatrix() {
             Submit My Placement
           </button>
         )}
-
         <button
-          onClick={handleRevealAll}
+          onClick={handleReveal}
           className="px-6 py-2.5 rounded-lg bg-green-700 hover:bg-green-600 font-semibold transition-colors"
         >
           Reveal All
         </button>
-
         <button
           onClick={handleReset}
           className="px-6 py-2.5 rounded-lg bg-gray-700 hover:bg-gray-600 font-semibold transition-colors"
@@ -396,20 +338,24 @@ export default function CoachingMatrix() {
         </button>
       </div>
 
-      {/* Legend (visible when revealed) */}
-      {phase === "revealed" && allPlacements.length > 0 && (
+      {/* Legend — revealed only */}
+      {phase === "revealed" && placements.length > 0 && (
         <div className="flex flex-wrap gap-3 justify-center mt-2 max-w-lg">
-          {allPlacements.map((p, i) => {
-            const isMe = p.name === myName;
-            const color = isMe ? "#1e293b" : DOT_COLORS[otherPlacements.findIndex(op => op.name === p.name) % DOT_COLORS.length];
+          {placements.map((p) => {
+            const isMe = p.name === name;
+            const otherIdx = others.findIndex((o) => o.name === p.name);
+            const color = isMe
+              ? "#ffffff"
+              : DOT_COLORS[otherIdx % DOT_COLORS.length];
             return (
               <div key={p.name} className="flex items-center gap-1.5">
                 <div
-                  className="w-3 h-3 rounded-full border border-white"
-                  style={{ backgroundColor: color }}
+                  className="w-3 h-3 rounded-full border border-gray-500"
+                  style={{ background: color }}
                 />
                 <span className="text-xs text-gray-300">
-                  {truncate(p.name)}{isMe ? " (you)" : ""}
+                  {truncate(p.name)}
+                  {isMe ? " (you)" : ""}
                 </span>
               </div>
             );
